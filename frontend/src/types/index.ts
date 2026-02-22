@@ -17,3 +17,21 @@ export interface AuditResult {
   summary: string;
   timestamp: string;
 }
+
+export interface MarkdownFile {
+  path: string;
+  content: string;
+}
+
+export type ScanStatus = 'NA' | 'FAIL' | 'PARCIAL' | 'PASS';
+
+export interface Repository {
+  id: string;
+  name: string;
+  url: string;
+  prNumber: number | null;
+  status: ScanStatus;
+  lastScan: string | null;
+  tags: string[];
+}
+

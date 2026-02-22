@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
@@ -21,9 +21,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.routers import audit
+from app.routers import audit, repository
+from app.websockets import manager
 
 app.include_router(audit.router, prefix="/api/v1")
+app.include_router(repository.router, prefix="/api/v1/repositories")
+
+@app.websocket("/api/v1/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # We just need to keep the connection alive
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 @app.get("/")
 async def root():

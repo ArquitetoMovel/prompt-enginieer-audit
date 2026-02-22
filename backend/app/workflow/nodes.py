@@ -51,8 +51,26 @@ async def fetch_repo_state(state: AuditState) -> Dict[str, Any]:
             raise ValueError("Invalid repository URL")
         owner, repo = parts[-2], parts[-1]
         
-        # 2. Try to list files via GitHub API
-        api_url = f"https://api.github.com/repos/{owner}/{repo}/contents"
+        pr_number = state.get('pr_number')
+        
+        # Obter automaticamente o numero do ultimo PR se nao fornecido
+        if not pr_number:
+            try:
+                pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls?state=all&per_page=1"
+                headers_pr = {"Accept": "application/vnd.github.v3+json"}
+                if settings.GITHUB_TOKEN:
+                    headers_pr["Authorization"] = f"token {settings.GITHUB_TOKEN}"
+                async with httpx.AsyncClient() as client:
+                    pr_resp = await client.get(pr_url, headers=headers_pr)
+                    if pr_resp.status_code == 200:
+                        prs = pr_resp.json()
+                        if prs and len(prs) > 0:
+                            pr_number = prs[0]['number']
+            except Exception as e:
+                logger.warning(f"Could not fetch latest PR: {e}")
+                
+        # 2. Extract PR files via GitHub API
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
         headers = {"Accept": "application/vnd.github.v3+json"}
         if settings.GITHUB_TOKEN:
             headers["Authorization"] = f"token {settings.GITHUB_TOKEN}"
@@ -63,20 +81,47 @@ async def fetch_repo_state(state: AuditState) -> Dict[str, Any]:
             resp = await client.get(api_url, headers=headers)
             
             if resp.status_code == 200:
-                # Successfully listed files
+                # Successfully listed PR files
                 items = resp.json()
-                # Filter for interesting text files (code, config, docs)
-                # Limit to avoid too many requests in this demo
-                interesting_extensions = ('.py', '.js', '.ts', '.tsx', '.md', '.txt', '.toml', '.json', '.yml', '.yaml')
-                candidates = [item for item in items if item['type'] == 'file' and item['name'].endswith(interesting_extensions)]
                 
-                # Take up to 5 files to stay within rate limits/context window for demo
-                for item in candidates[:5]:
-                    content = await fetch_github_file_content(repo_url, item['path'])
+                # Only care about added/modified
+                candidates = [
+                    item for item in items 
+                    if item.get('status') in ('added', 'modified', 'changed', 'renamed')
+                ]
+                
+                # Filter for interesting extensions. Source code is needed to analyze implementation.
+                interesting_extensions = ('.py', '.js', '.ts', '.tsx', '.md', '.txt', '.toml', '.json', '.yml', '.yaml')
+                candidates = [c for c in candidates if c['filename'].endswith(interesting_extensions)]
+                
+                # Prioritize agentic MDs, then other MDs, then other files
+                def sort_key(c):
+                    fn = c['filename']
+                    agentic_dirs = (".github/", ".claude/", ".gemini/", ".agent/", ".agents/", "docs/", "specs/", "docs/specs/")
+                    agentic_keywords = ("skill", "agent", "plan", "spec", "tasks", "task", "instructions")
+                    fn_lower = fn.lower()
+                    is_agentic = any(fn.startswith(d) for d in agentic_dirs) or any(kw in fn_lower for kw in agentic_keywords)
+                    is_md = fn.endswith('.md')
+                    
+                    if is_agentic and is_md:
+                        return 0
+                    if is_md:
+                        return 1
+                    return 2
+                
+                candidates.sort(key=sort_key)
+                
+                # Take up to 10 files to stay within context windows for this demo
+                for item in candidates[:10]:
+                    file_path = item['filename']
+                    # We can use the original fetch_github_file_content or the patch directly
+                    # The patch contains the diff, which is sometimes better for PR code review,
+                    # but we also might want the full file for docs. We'll use the fallback fetcher for raw content.
+                    content = await fetch_github_file_content(repo_url, file_path)
                     if content:
-                        existing_files.append({"path": item['path'], "content": content})
+                        existing_files.append({"path": file_path, "content": content})
             else:
-                logger.warning(f"Failed to list files from GitHub API: {resp.status_code}. Fallback to common files.")
+                logger.warning(f"Failed to list PR files from GitHub API: {resp.status_code}. Fallback to common files.")
                 # Fallback to common files if listing fails (e.g. auth issues or private repo without token)
                 common_files = ["README.md", "pyproject.toml", "requirements.txt", "main.py", "app.py"]
                 for file_path in common_files:
@@ -86,9 +131,9 @@ async def fetch_repo_state(state: AuditState) -> Dict[str, Any]:
         
         if not existing_files:
              logger.warning("No files found via GitHub API.")
-             return {"files_to_audit": [], "errors": ["No accessible files found."]}
+             return {"files_to_audit": [], "errors": ["No accessible files found."], "pr_number": pr_number}
 
-        return {"files_to_audit": existing_files}
+        return {"files_to_audit": existing_files, "pr_number": pr_number}
 
     except Exception as e:
         logger.error(f"Error in fetch_repo_state: {e}")
@@ -97,6 +142,7 @@ async def fetch_repo_state(state: AuditState) -> Dict[str, Any]:
 # --- LLM Analysis ---
 
 class AnalysisResult(BaseModel):
+    status: str = Field(description="Must be one of: FAIL, PARCIAL, PASS, NA. Determines final pass criteria based on found documentation.")
     violations: List[CodeViolation]
     summary: str
 
@@ -111,18 +157,28 @@ async def analyze_files(state: AuditState) -> Dict[str, Any]:
         return {
             "audit_results": {
                 "violations": [],
-                "status": "SKIPPED",
+                "status": "NA",
                 "summary": "No accessible files found to audit."
             }
         }
 
     # Prepare LLM
-    llm = ChatOpenAI(model="gpt-4-turbo-preview", temperature=0) # Use a capable model
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0) # Use a capable model
     
     parser = JsonOutputParser(pydantic_object=AnalysisResult)
     
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are an expert code auditor specializing in security, best practices, and architecture. Analyze the provided code files and report any violations. Return the result in JSON format."),
+        ("system", "You are an expert AI code auditor. You are evaluating PR changes against AI development best practices.\n\n"
+                  "RULES:\n"
+                  "1. Detect agentic documentation inside directories like .github, .claude, .gemini, .agent, .agents, docs, specs, docs/specs, or files with keywords: SKILL, agent, plan, spec, tasks, task, instructions.\n"
+                  "2. If ANY agentic documentation matching rule 1 is detected, you MUST set the status to 'PASS' (verde).\n"
+                  "3. If NO agentic docs (no new or altered documentation matching rule 1) are detected in the PR, but at least one README file with relevant content is detected, set the status to 'PARCIAL' (amarelo).\n"
+                  "4. If NO agentic docs and NO relevant README are detected in the PR, set status to 'FAIL' (vermelho).\n"
+                  "5. Even if the status is 'PASS' or 'PARCIAL', you can still list violations if the documentation is incoherent with the source code implementation or missing critical contexts.\n"
+                  "6. You can also use 'FAIL' if there's a catastrophic error in the analysis or if you explicitly determine the PR is entirely destructive.\n"
+                  "7. Use 'NA' if the files cannot be analyzed properly.\n\n"
+                  "8. Use 'FAIL'if the PR not contains any documentation."
+                  "Return the result exactly matching the requested JSON format, with a status field of 'FAIL', 'PARCIAL', 'PASS', or 'NA'."),
         ("user", "Analyze the following files:\n\n{files_context}\n\n{format_instructions}")
     ])
 
@@ -140,7 +196,7 @@ async def analyze_files(state: AuditState) -> Dict[str, Any]:
         })
         
         violations = result.get("violations", [])
-        status = "NOK" if violations else "OK"
+        status = result.get("status", "FAIL")
         summary = result.get("summary", "Analysis completed.")
         
         return {
@@ -156,7 +212,7 @@ async def analyze_files(state: AuditState) -> Dict[str, Any]:
         return {
             "audit_results": {
                 "violations": [],
-                "status": "ERROR",
+                "status": "FAIL",
                 "summary": f"Analysis failed: {str(e)}"
             }
         }
@@ -168,21 +224,21 @@ async def generate_report(state: AuditState) -> Dict[str, Any]:
     logger.info("Generating report...")
     audit_results = state.get("audit_results")
     if not audit_results:
-        return {"final_report": "Error: No analysis results found."}
+        return {"final_report": "Erro: Nenhum resultado de análise encontrado."}
 
     violations = audit_results.get("violations", [])
-    status = audit_results.get("status", "UNKNOWN")
-    summary = audit_results.get("summary", "No summary provided.")
+    status = audit_results.get("status", "DESCONHECIDO")
+    summary = audit_results.get("summary", "Nenhum resumo fornecido.")
     
-    report = f"# Audit Report\n\n**Status**: {status}\n\n**Summary**: {summary}\n\n## Violations:\n"
+    report = f"# Relatório de Auditoria\n\n**Status**: {status}\n\n**Resumo**: {summary}\n\n## Violações:\n"
     if not violations:
-        report += "- No violations found."
+        report += "- Nenhuma violação encontrada."
     else:
         for v in violations:
             # Handle dictionary or Pydantic object
             if isinstance(v, dict):
                 severity = v.get('severity', 'info').upper()
-                file_path = v.get('file_path', 'unknown')
+                file_path = v.get('file_path', 'desconhecido')
                 message = v.get('message', '')
                 suggestion = v.get('suggestion', '')
             else:
@@ -191,6 +247,6 @@ async def generate_report(state: AuditState) -> Dict[str, Any]:
                 message = v.message
                 suggestion = v.suggestion
 
-            report += f"- **{severity}** in `{file_path}`: {message}\n  - *Suggestion*: {suggestion}\n"
+            report += f"- **{severity}** em `{file_path}`: {message}\n  - *Sugestão*: {suggestion}\n"
     
     return {"final_report": report}
