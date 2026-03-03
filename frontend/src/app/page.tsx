@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import React, { useState, useEffect } from "react";
 import Link from "next/link";
 import { Repository, ScanStatus } from "@/types";
-import { fetchRepositories, runScan } from "@/services/api";
+import { fetchRepositories, runScan, fetchPullRequests } from "@/services/api";
 import {
   RefreshCw,
   ExternalLink,
@@ -20,6 +20,10 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState<string | null>(null);
   const [selectedAuditId, setSelectedAuditId] = useState<string | null>(null);
+
+  const [expandedRepos, setExpandedRepos] = useState<Set<string>>(new Set());
+  const [repoPRs, setRepoPRs] = useState<Record<string, any[]>>({});
+  const [loadingPRs, setLoadingPRs] = useState<Record<string, boolean>>({});
 
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage, setItemsPerPage] = useState(9);
@@ -106,15 +110,39 @@ export default function Dashboard() {
     };
   }, []);
 
-  const handleScan = async (repo: Repository) => {
+  const handleScan = async (repoId: string, url: string, prNumber: number) => {
+    // Note: scanning state is now based on a unique key combining repo ID and PR Number
+    const scanKey = `${repoId}-${prNumber}`;
     if (scanning) return;
-    setScanning(repo.id);
+    setScanning(repoId); // Using repoId for the global sync, though we could refine it
     try {
-      await runScan(repo.id, repo.url, repo.prNumber);
-      // We no longer call loadRepos() manually here because the websocket will update the grid.
-      // We also do not clear the 'scanning' state here, the websocket will do it upon PASS/FAIL.
+      await runScan(repoId, url, prNumber);
     } catch {
       setScanning(null);
+    }
+  };
+
+  const toggleRepoExpansion = async (repo: Repository) => {
+    const newExpanded = new Set(expandedRepos);
+    if (newExpanded.has(repo.id)) {
+      newExpanded.delete(repo.id);
+      setExpandedRepos(newExpanded);
+      return;
+    }
+
+    newExpanded.add(repo.id);
+    setExpandedRepos(newExpanded);
+
+    if (!repoPRs[repo.id]) {
+      setLoadingPRs((prev) => ({ ...prev, [repo.id]: true }));
+      try {
+        const prs = await fetchPullRequests(repo.url);
+        setRepoPRs((prev) => ({ ...prev, [repo.id]: prs }));
+      } catch (err) {
+        console.error("Failed to load PRs for", repo.name, err);
+      } finally {
+        setLoadingPRs((prev) => ({ ...prev, [repo.id]: false }));
+      }
     }
   };
 
@@ -217,25 +245,13 @@ export default function Dashboard() {
                     scope="col"
                     className="px-6 py-4 text-center text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider"
                   >
-                    Pull Request
-                  </th>
-                  <th
-                    scope="col"
-                    className="px-6 py-4 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider"
-                  >
                     Status
                   </th>
                   <th
                     scope="col"
                     className="px-6 py-4 text-center text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider"
                   >
-                    Detalhes
-                  </th>
-                  <th
-                    scope="col"
-                    className="px-6 py-4 text-center text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider"
-                  >
-                    Scan
+                    Ações
                   </th>
                 </tr>
               </thead>
@@ -269,91 +285,156 @@ export default function Dashboard() {
                   </tr>
                 ) : (
                   currentRepos.map((repo) => (
-                    <tr
-                      key={repo.id}
-                      className="hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors duration-200"
-                    >
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="text-sm font-semibold text-gray-900 dark:text-white">
-                          {repo.name}
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="flex flex-wrap gap-1 max-w-[150px]">
-                          {repo.tags && repo.tags.length > 0 ? (
-                            repo.tags.map((tag) => (
-                              <button
-                                key={tag}
-                                onClick={() => handleTagClick(tag)}
-                                className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
-                                  selectedTag === tag
-                                    ? "bg-indigo-500 text-white dark:bg-indigo-600 dark:text-white shadow-sm"
-                                    : "bg-blue-100 text-blue-800 hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-200 dark:hover:bg-blue-800"
-                                }`}
-                              >
-                                {tag}
-                              </button>
-                            ))
-                          ) : (
-                            <span className="text-xs text-gray-400">
-                              Sem tags
+                    <React.Fragment key={repo.id}>
+                      <tr
+                        className={`hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors duration-200 ${expandedRepos.has(repo.id) ? "bg-indigo-50/30 dark:bg-indigo-900/10" : ""}`}
+                      >
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="text-sm font-semibold text-gray-900 dark:text-white">
+                            {repo.name}
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="flex flex-wrap gap-1 max-w-[150px]">
+                            {repo.tags && repo.tags.length > 0 ? (
+                              repo.tags.map((tag) => (
+                                <button
+                                  key={tag}
+                                  onClick={() => handleTagClick(tag)}
+                                  className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                                    selectedTag === tag
+                                      ? "bg-indigo-500 text-white dark:bg-indigo-600 dark:text-white shadow-sm"
+                                      : "bg-blue-100 text-blue-800 hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-200 dark:hover:bg-blue-800"
+                                  }`}
+                                >
+                                  {tag}
+                                </button>
+                              ))
+                            ) : (
+                              <span className="text-xs text-gray-400">
+                                Sem tags
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <a
+                            href={repo.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-sm text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 flex items-center group transition-colors"
+                          >
+                            <span className="truncate max-w-[200px]">
+                              {repo.url}
                             </span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <a
-                          href={repo.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-sm text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 flex items-center group transition-colors"
-                        >
-                          <span className="truncate max-w-[200px]">
-                            {repo.url}
-                          </span>
-                          <ExternalLink className="w-4 h-4 ml-1 opacity-0 group-hover:opacity-100 transition-opacity" />
-                        </a>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-center">
-                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-sm font-medium bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200">
-                          #{repo.prNumber || "N/A"}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <StatusIndicator status={repo.status} />
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-center">
-                        <button
-                          onClick={() => setSelectedAuditId(repo.id)}
-                          className="text-sm font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-900 dark:hover:text-indigo-300 hover:underline transition-all"
-                        >
-                          Ver Resultados
-                        </button>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-center">
-                        <button
-                          onClick={() => handleScan(repo)}
-                          disabled={
-                            scanning === repo.id ||
-                            (scanning !== null && scanning !== repo.id)
-                          }
-                          className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-bold rounded-full shadow-sm text-white ${
-                            scanning === repo.id
-                              ? "bg-indigo-400 cursor-not-allowed"
-                              : scanning !== null
-                                ? "bg-gray-300 cursor-not-allowed"
-                                : "bg-gradient-to-r from-teal-500 to-emerald-500 hover:from-teal-600 hover:to-emerald-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 hover:scale-105 transform transition-all duration-200"
-                          }`}
-                        >
-                          {scanning === repo.id ? (
-                            <RefreshCw className="w-4 h-4 mr-1 animate-spin" />
-                          ) : (
-                            <Play className="w-4 h-4 mr-1" />
-                          )}
-                          {scanning === repo.id ? "Analisando..." : "Analisar"}
-                        </button>
-                      </td>
-                    </tr>
+                            <ExternalLink className="w-4 h-4 ml-1 opacity-0 group-hover:opacity-100 transition-opacity" />
+                          </a>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-center">
+                          <div className="flex justify-center">
+                            <StatusIndicator status={repo.status} />
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-center">
+                          <div className="flex items-center justify-center space-x-3">
+                            <button
+                              onClick={() => setSelectedAuditId(repo.id)}
+                              className="text-sm font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-900 dark:hover:text-indigo-300 hover:underline transition-all"
+                            >
+                              Resultados Globais
+                            </button>
+                            <button
+                              onClick={() => toggleRepoExpansion(repo)}
+                              className="inline-flex items-center px-4 py-1.5 border border-transparent text-xs font-bold rounded-lg shadow-sm text-white bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-200"
+                            >
+                              {expandedRepos.has(repo.id)
+                                ? "Ocultar PRs"
+                                : "Listar PRs"}
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                      {expandedRepos.has(repo.id) && (
+                        <tr>
+                          <td
+                            colSpan={5}
+                            className="p-0 bg-gray-50/50 dark:bg-gray-800/30"
+                          >
+                            <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700">
+                              {loadingPRs[repo.id] ? (
+                                <div className="flex items-center justify-center p-4">
+                                  <RefreshCw className="w-5 h-5 mr-2 animate-spin text-indigo-500" />
+                                  <span className="text-sm text-gray-500 dark:text-gray-400">
+                                    Buscando PRs no GitHub...
+                                  </span>
+                                </div>
+                              ) : repoPRs[repo.id] &&
+                                repoPRs[repo.id].length > 0 ? (
+                                <div className="space-y-3">
+                                  <h4 className="text-sm font-semibold text-gray-900 dark:text-white flex items-center mb-2">
+                                    <SearchCode className="w-4 h-4 mr-1 text-gray-500" />{" "}
+                                    PULL REQUESTS RECENTES
+                                  </h4>
+                                  <ul className="grid grid-cols-1 gap-3">
+                                    {repoPRs[repo.id].map((pr) => (
+                                      <li
+                                        key={pr.number}
+                                        className="flex items-center justify-between bg-white dark:bg-gray-800 p-3 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm hover:shadow-md transition-shadow"
+                                      >
+                                        <div className="flex flex-col">
+                                          <div className="flex items-center">
+                                            <span className="px-2.5 py-0.5 rounded-md text-xs font-bold bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-200 mr-2">
+                                              #{pr.number}
+                                            </span>
+                                            <span className="text-sm font-medium text-gray-800 dark:text-gray-200 truncate max-w-[200px] sm:max-w-xs">
+                                              {pr.title || "Sem título"}
+                                            </span>
+                                          </div>
+                                          <span className="text-xs text-gray-500 dark:text-gray-400 mt-1 ml-1">
+                                            {pr.created_at
+                                              ? new Date(
+                                                  pr.created_at,
+                                                ).toLocaleDateString()
+                                              : "Data Desconhecida"}
+                                          </span>
+                                        </div>
+                                        <button
+                                          onClick={() =>
+                                            handleScan(
+                                              repo.id,
+                                              repo.url,
+                                              pr.number,
+                                            )
+                                          }
+                                          disabled={scanning === repo.id}
+                                          className={`ml-4 shrink-0 inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-bold rounded-full shadow-sm text-white ${
+                                            scanning === repo.id
+                                              ? "bg-gray-400 cursor-not-allowed"
+                                              : "bg-gradient-to-r from-teal-500 to-emerald-500 hover:from-teal-600 hover:to-emerald-600 hover:scale-105 transform transition-all duration-200"
+                                          }`}
+                                        >
+                                          {scanning === repo.id ? (
+                                            <RefreshCw className="w-3.5 h-3.5 mr-1 animate-spin" />
+                                          ) : (
+                                            <Play className="w-3.5 h-3.5 mr-1" />
+                                          )}
+                                          Analisar
+                                        </button>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              ) : (
+                                <p className="text-sm text-gray-500 dark:text-gray-400 p-4 text-center">
+                                  Nenhum Pull Request modificado recentemente
+                                  encontrado.
+                                </p>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
                   ))
                 )}
               </tbody>

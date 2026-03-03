@@ -13,6 +13,7 @@ audit_store: Dict[str, Dict[str, Any]] = {}
 
 from app.routers.repository import repositories_store
 from app.websockets import manager
+from app.services.github_service import GitHubService
 
 async def run_audit_task(audit_id: str, request: AuditRequest):
     # Update status to running
@@ -66,6 +67,15 @@ async def run_audit_task(audit_id: str, request: AuditRequest):
         if audit_id in repositories_store:
             repositories_store[audit_id]["ScanStatus"] = "FAIL"
             await manager.broadcast({"type": "repo_update", "data": repositories_store[audit_id], "event": "audit_failed"})
+
+@router.get("/prs", response_model=list[dict])
+async def list_pull_requests(repo_url: str, limit: int = 5):
+    try:
+        github_service = GitHubService()
+        prs = await github_service.fetch_recent_pull_requests(repo_url, limit=limit)
+        return [{"number": pr.number, "title": pr.title, "created_at": pr.created_at.isoformat() if pr.created_at else None} for pr in prs]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/audit", response_model=dict)
 async def trigger_audit(request: AuditRequest, background_tasks: BackgroundTasks):

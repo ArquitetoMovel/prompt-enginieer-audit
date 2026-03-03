@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Prompt Engineer Audit"
@@ -14,8 +15,9 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379"
     
     # OpenAI/Anthropic API Keys
-    OPENAI_API_KEY: str | None = None
-    ANTHROPIC_API_KEY: str | None = None
+    # OpenAI/Anthropic API Keys
+    OPENAI_API_KEY: Optional[str] = None
+    ANTHROPIC_API_KEY: Optional[str] = None
     
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 

@@ -39,6 +39,18 @@ export async function fetchRepositories(): Promise<Repository[]> {
   return getLocalRepos();
 }
 
+export async function fetchPullRequests(repoUrl: string, limit: number = 5): Promise<any[]> {
+  try {
+    const res = await fetch(`http://localhost:8000/api/v1/prs?repo_url=${encodeURIComponent(repoUrl)}&limit=${limit}`);
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (e) {
+    console.warn('Backend not available for fetchPullRequests', e);
+  }
+  return [];
+}
+
 export async function createRepository(name: string, url: string, prNumber?: number, tags: string[] = []): Promise<Repository> {
   const payload = {
     RepositoryName: name,
